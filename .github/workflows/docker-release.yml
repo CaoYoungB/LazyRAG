@@ -1,10 +1,16 @@
+# Variables that need to be configured in the repository:
+## vars.REGISTRY && vars.REGISTRY_NAMESPACE && 
+## secrets.REGISTRY_USERNAME && secrets.REGISTRY_PASSWORD
+
+# Creates images for both linux/amd64 and linux/arm64 platforms
+
 name: Docker Release
 
 on:
   push:
     branches:
       - main
-      - cl/caoyangbo/build-ci
+      - "v*"
     tags:
       - "v*"
     paths-ignore:
@@ -20,7 +26,7 @@ on:
         required: true
         type: string
       service:
-        description: JSON array of services to build (e.g. ["backend","frontend"] or ["all"])
+        description: JSON array of services to build (e.g. [ "backend", "frontend", "mineru", "processor-server", "processor-worker", "parsing", "chat", "auth-service" ] or ["all"])
         required: false
         default: '["all"]'
         type: string
@@ -35,6 +41,8 @@ env:
   REGISTRY: ${{ vars.REGISTRY || 'registry.gitlab.com' }}
   # Namespace/repository path in GitLab registry (group/project)
   REGISTRY_NAMESPACE: ${{ vars.REGISTRY_NAMESPACE || github.repository }}
+  
+
 
 jobs:
   docker-release:
@@ -48,73 +56,46 @@ jobs:
           - service: auth-service
             dockerfile: backend/auth-service/Dockerfile
             context: backend
-            image: auth-service
+            image: lazyrag-auth-service
           - service: backend
             dockerfile: backend/core/Dockerfile
             context: backend
-            image: backend
+            image: lazyrag-backend
           - service: frontend
             dockerfile: frontend/Dockerfile
             context: frontend
-            image: frontend
+            image: lazyrag-frontend
           - service: mineru
             dockerfile: algorithm/Dockerfile
             context: algorithm
             target: mineru
-            image: mineru
+            image: lazyrag-mineru
           - service: processor-server
             dockerfile: algorithm/Dockerfile
             context: algorithm
             target: default
-            image: processor-server
+            image: lazyrag-processor-server
           - service: processor-worker
             dockerfile: algorithm/Dockerfile
             context: algorithm
             target: default
-            image: processor-worker
+            image: lazyrag-processor-worker
           - service: parsing
             dockerfile: algorithm/Dockerfile
             context: algorithm
             target: default
-            image: parsing
+            image: lazyrag-parsing
           - service: chat
             dockerfile: algorithm/Dockerfile
             context: algorithm
             target: default
-            image: chat
+            image: lazyrag-chat
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
-
-
-      - name: Resolve release tag
-        id: tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ inputs.tag }}"
-          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            TAG="${GITHUB_REF_NAME}"
-          else
-            TAG="main-${GITHUB_SHA::7}"
-          fi
-          echo "value=${TAG}" >> "${GITHUB_OUTPUT}"
-
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-
-      - name: Login to Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
 
 
       - name: Detect changed services
@@ -141,8 +122,9 @@ jobs:
           echo "services=$SERVICES" >> $GITHUB_OUTPUT
 
 
-      - name: Build and push ${{ matrix.service }}
-        uses: docker/build-push-action@v6
+      - name: Resolve release tag
+        id: tag
+        shell: bash
         if: |
           (github.event_name == 'workflow_dispatch' &&
             (
@@ -156,13 +138,76 @@ jobs:
           (github.event_name == 'push' && github.ref_type != 'tag' &&
             contains(steps.changes.outputs.services, matrix.service)
           )
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="main-${GITHUB_SHA::7}"
+          fi
+          echo "value=${TAG}" >> "${GITHUB_OUTPUT}"
+
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        if: ${{ steps.tag.outputs.value != '' }}
+
+
+      - name: Login to Registry
+        uses: docker/login-action@v3
+        if: ${{ steps.tag.outputs.value != '' }}
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+
+      - name: Build and push ${{ matrix.service }} - linux/amd64
+        uses: docker/build-push-action@v6
+        if: ${{ steps.tag.outputs.value != '' }}
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
           push: true
           provenance: false
-          platforms: linux/amd64,linux/arm64 
+          platforms: linux/amd64
           tags: |
-            ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}:${{ steps.tag.outputs.value }}
-            # ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}:latest
+            ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}:${{ steps.tag.outputs.value }}-amd64
+            ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}:latest-amd64
+
+      - name: Build and push ${{ matrix.service }} - linux/arm64 
+        uses: docker/build-push-action@v6
+        if: ${{ steps.tag.outputs.value != '' }}
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          push: true
+          provenance: false
+          platforms: linux/arm64 
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}:${{ steps.tag.outputs.value }}-arm64
+            ${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}:latest-arm64
+            
+      - name: Create and push manifest
+        if: ${{ steps.tag.outputs.value != '' }}
+        run: |          
+          IMAGE="${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/${{ matrix.image }}"
+          
+          echo "Waiting for images to be available..."
+          sleep 30
+          
+          # Create manifest
+          docker manifest create $IMAGE:${{ steps.tag.outputs.value }} \
+            --amend $IMAGE:${{ steps.tag.outputs.value }}-arm64 \
+            --amend $IMAGE:${{ steps.tag.outputs.value }}-amd64 || true
+          docker manifest push $IMAGE:${{ steps.tag.outputs.value }}
+          
+          # Create latest manifest
+          docker manifest create $IMAGE:latest \
+            --amend $IMAGE:latest-arm64 \
+            --amend $IMAGE:latest-amd64 || true
+          docker manifest push $IMAGE:latest
